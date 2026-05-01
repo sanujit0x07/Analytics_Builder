@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { toast } from "sonner";
 import {
   Activity,
+  ArrowRight,
   Boxes,
   CheckCircle2,
   ChevronDown,
@@ -17,10 +19,12 @@ import {
   Plug,
   RefreshCw,
   Search,
+  ShieldAlert,
   Square,
   Trash2,
   XCircle,
 } from "lucide-react";
+import type { Parameter, RiskSurface } from "@/lib/claude-pipeline";
 import {
   Tabs,
   TabsContent,
@@ -86,24 +90,18 @@ export function BuildConsole({ initialJob }: { initialJob: JobRun }) {
           </TabsList>
 
           <TabsContent value="overview" className="py-6">
-            <Overview job={job} />
+            <Overview job={job} setJob={setJob} />
           </TabsContent>
           <TabsContent value="classification" className="py-6">
-            <Placeholder
-              title="Archetype: Lending (pooled, isolated mode)"
-              body="Confidence 0.94 — derived from Pool.sol::supply / withdraw / borrow / repay / liquidationCall, ReserveConfiguration, and PriceOracleSentinel. Detail panel coming next."
-            />
+            <ClassificationPanel job={job} />
           </TabsContent>
           <TabsContent value="fetch" className="py-6">
-            <Placeholder
-              title={`${job.stats.fetchCalls} fetch calls across ${new Set(job.source.contracts.map((c) => c.chainId)).size} chains`}
-              body="Multicall3 batches, queryFilter configs, and refresh cadences will render here as a per-parameter table."
-            />
+            <FetchPlanPanel job={job} />
           </TabsContent>
           <TabsContent value="tokens" className="py-6">
             <Placeholder
-              title="Design tokens — auto_extracted from app.aave.com"
-              body="Palette / typography / radius / shadow inspector will render here once the brand explorer is wired in."
+              title="Design tokens"
+              body="Palette / typography / radius / shadow inspector will render here once the brand auto-extract step is wired in."
             />
           </TabsContent>
           <TabsContent value="logs" className="py-6">
@@ -191,14 +189,45 @@ function TabTrigger({
   );
 }
 
-function Overview({ job }: { job: JobRun }) {
+function Overview({
+  job,
+  setJob,
+}: {
+  job: JobRun;
+  setJob: (j: JobRun) => void;
+}) {
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-      <BuildSummary job={job} />
-      <BuildProgress job={job} />
-      <SourceCard job={job} />
-      <HowItWorksCard />
+    <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <BuildSummary job={job} />
+        <BuildProgress job={job} />
+        <SourceCard job={job} />
+        <HowItWorksCard />
+      </div>
+      {job.status === "completed" && job.analysis && (
+        <ParameterSelection job={job} setJob={setJob} />
+      )}
+      {job.status === "failed" && job.error && (
+        <FailureCard error={job.error} />
+      )}
     </div>
+  );
+}
+
+function FailureCard({ error }: { error: string }) {
+  return (
+    <section className="flex flex-col gap-2 rounded-xl bg-destructive/5 p-5 ring-1 ring-destructive/30">
+      <div className="flex items-center gap-2">
+        <ShieldAlert className="size-4 text-destructive" />
+        <h2 className="font-heading text-base font-medium text-destructive">
+          Build failed
+        </h2>
+      </div>
+      <p className="text-sm text-foreground/90">{error}</p>
+      <p className="text-xs text-muted-foreground">
+        Common causes: ANTHROPIC_API_KEY not set, ZIP missing src/ or contracts/, or the bundle exceeded the source cap.
+      </p>
+    </section>
   );
 }
 
@@ -552,6 +581,348 @@ function Placeholder({ title, body }: { title: string; body: string }) {
     <div className="flex flex-col gap-2 rounded-xl bg-card p-6 ring-1 ring-foreground/10">
       <h3 className="font-heading text-base font-medium">{title}</h3>
       <p className="text-sm leading-6 text-muted-foreground">{body}</p>
+    </div>
+  );
+}
+
+const SURFACE_LABEL: Record<RiskSurface, string> = {
+  solvency: "Solvency",
+  liquidity: "Liquidity",
+  oracle: "Oracle",
+  market: "Market",
+  smart_contract: "Smart contract",
+  governance: "Governance",
+};
+
+const SURFACE_COLOR: Record<RiskSurface, string> = {
+  solvency: "text-rose-300 bg-rose-400/10 ring-rose-400/30",
+  liquidity: "text-cyan-300 bg-cyan-400/10 ring-cyan-400/30",
+  oracle: "text-amber-300 bg-amber-400/10 ring-amber-400/30",
+  market: "text-violet-300 bg-violet-400/10 ring-violet-400/30",
+  smart_contract: "text-fuchsia-300 bg-fuchsia-400/10 ring-fuchsia-400/30",
+  governance: "text-lime-300 bg-lime-400/10 ring-lime-400/30",
+};
+
+function ParameterSelection({
+  job,
+  setJob,
+}: {
+  job: JobRun;
+  setJob: (j: JobRun) => void;
+}) {
+  const analysis = job.analysis!;
+  const [selected, setSelected] = useState<Set<string>>(
+    new Set(job.selectedParamIds ?? analysis.parameters.map((p) => p.id))
+  );
+  const [saving, setSaving] = useState(false);
+
+  const grouped = useMemo(() => {
+    const map = new Map<RiskSurface, Parameter[]>();
+    for (const p of analysis.parameters) {
+      const arr = map.get(p.surface) ?? [];
+      arr.push(p);
+      map.set(p.surface, arr);
+    }
+    return Array.from(map.entries()).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+  }, [analysis.parameters]);
+
+  function toggle(id: string) {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSurface(surface: RiskSurface, on: boolean) {
+    setSelected((s) => {
+      const next = new Set(s);
+      for (const p of analysis.parameters) {
+        if (p.surface !== surface) continue;
+        if (on) next.add(p.id);
+        else next.delete(p.id);
+      }
+      return next;
+    });
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/select`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paramIds: Array.from(selected) }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error ?? "Failed to save selection");
+        setSaving(false);
+        return;
+      }
+      const next = { ...job, selectedParamIds: Array.from(selected) };
+      setJob(next);
+      toast.success(`Saved ${selected.size} parameter(s)`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="flex flex-col gap-4 rounded-xl bg-card p-5 ring-1 ring-foreground/10">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <h2 className="font-heading text-base font-medium">
+            Select parameters for the dashboard
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            All {analysis.parameters.length} are selected by default. Untick anything you don&apos;t want surfaced. Grouped by risk surface.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            <span className="text-foreground">{selected.size}</span> /{" "}
+            {analysis.parameters.length} selected
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setSelected(new Set(analysis.parameters.map((p) => p.id)))}
+          >
+            Select all
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
+            Clear
+          </Button>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        {grouped.map(([surface, params]) => (
+          <SurfaceGroup
+            key={surface}
+            surface={surface}
+            params={params}
+            selected={selected}
+            onToggle={toggle}
+            onToggleAll={(on) => toggleSurface(surface, on)}
+          />
+        ))}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-4">
+        <div className="text-xs text-muted-foreground">
+          {analysis.risk_summary && (
+            <span className="line-clamp-2 max-w-2xl">
+              <span className="text-foreground">Risk summary —</span>{" "}
+              {analysis.risk_summary}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save selection"}
+          </Button>
+          <Link
+            href={`/dashboard/${job.id}`}
+            className={cn(
+              buttonVariants({ size: "sm" }),
+              "bg-lime-400 text-black hover:bg-lime-400/90"
+            )}
+          >
+            Open dashboard
+            <ArrowRight className="size-3.5" />
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SurfaceGroup({
+  surface,
+  params,
+  selected,
+  onToggle,
+  onToggleAll,
+}: {
+  surface: RiskSurface;
+  params: Parameter[];
+  selected: Set<string>;
+  onToggle: (id: string) => void;
+  onToggleAll: (on: boolean) => void;
+}) {
+  const allOn = params.every((p) => selected.has(p.id));
+  const someOn = !allOn && params.some((p) => selected.has(p.id));
+  return (
+    <div className="flex flex-col gap-2 rounded-lg bg-muted/20 p-3 ring-1 ring-border">
+      <div className="flex items-center justify-between gap-2">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1",
+            SURFACE_COLOR[surface]
+          )}
+        >
+          {SURFACE_LABEL[surface]}
+          <span className="opacity-70">· {params.length}</span>
+        </span>
+        <button
+          type="button"
+          onClick={() => onToggleAll(!allOn)}
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {allOn ? "Clear group" : someOn ? "Select all" : "Select all"}
+        </button>
+      </div>
+      <ul className="flex flex-col gap-1">
+        {params.map((p) => (
+          <li key={p.id}>
+            <label
+              className={cn(
+                "flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-muted/30",
+                selected.has(p.id) && "bg-muted/30"
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(p.id)}
+                onChange={() => onToggle(p.id)}
+                className="mt-0.5 size-3.5 accent-lime-400"
+              />
+              <div className="flex flex-1 flex-col gap-0.5">
+                <span className="text-sm text-foreground">{p.name}</span>
+                <span className="text-[11px] leading-4 text-muted-foreground">
+                  {p.description}
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground/80">
+                  {p.source} · {p.cadence} · {p.unit}
+                  {p.needs_indexing && (
+                    <span className="ml-1 rounded bg-orange-400/15 px-1 py-0.5 text-orange-300">
+                      indexer
+                    </span>
+                  )}
+                </span>
+              </div>
+            </label>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ClassificationPanel({ job }: { job: JobRun }) {
+  if (!job.analysis) {
+    return (
+      <Placeholder
+        title="Classification pending"
+        body="Claude is still analyzing the source. The archetype, sub-type, and confidence will appear here once classification completes."
+      />
+    );
+  }
+  const a = job.analysis;
+  return (
+    <div className="flex flex-col gap-4">
+      <section className="flex flex-col gap-3 rounded-xl bg-card p-5 ring-1 ring-foreground/10">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-heading text-lg font-medium capitalize">
+            {a.archetype.replace(/_/g, " ")}
+          </span>
+          <span className="text-muted-foreground">— {a.subtype}</span>
+          <span className="ml-auto inline-flex h-6 items-center rounded-full bg-lime-400/15 px-2.5 text-xs font-medium text-lime-300 ring-1 ring-lime-400/30">
+            confidence {a.confidence.toFixed(2)}
+          </span>
+        </div>
+        <p className="text-sm leading-6 text-foreground/90">{a.risk_summary}</p>
+      </section>
+
+      {a.open_questions.length > 0 && (
+        <section className="flex flex-col gap-2 rounded-xl bg-card p-5 ring-1 ring-foreground/10">
+          <h3 className="font-heading text-sm font-medium">Open questions</h3>
+          <ul className="space-y-1.5 text-sm leading-6 text-muted-foreground">
+            {a.open_questions.map((q, i) => (
+              <li key={i} className="flex gap-2">
+                <span className="text-amber-300">·</span>
+                <span>{q}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function FetchPlanPanel({ job }: { job: JobRun }) {
+  if (!job.analysis) {
+    return (
+      <Placeholder
+        title="Fetch plan pending"
+        body="Per-parameter on-chain sources, cadence, and indexer requirements will render here once analysis completes."
+      />
+    );
+  }
+  const params = job.analysis.parameters;
+  const live = params.filter((p) => !p.needs_indexing);
+  const indexer = params.filter((p) => p.needs_indexing);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <header className="flex flex-wrap gap-3 text-sm">
+        <span className="rounded-md bg-lime-400/10 px-2.5 py-1 text-lime-300 ring-1 ring-lime-400/30">
+          {live.length} live multicall3 reads
+        </span>
+        {indexer.length > 0 && (
+          <span className="rounded-md bg-orange-400/10 px-2.5 py-1 text-orange-300 ring-1 ring-orange-400/30">
+            {indexer.length} need event indexing
+          </span>
+        )}
+      </header>
+      <div className="overflow-hidden rounded-xl ring-1 ring-foreground/10">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/30 text-[10px] uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 text-left">Parameter</th>
+              <th className="px-3 py-2 text-left">Surface</th>
+              <th className="px-3 py-2 text-left">Source</th>
+              <th className="px-3 py-2 text-left">Cadence</th>
+              <th className="px-3 py-2 text-left">Unit</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {params.map((p) => (
+              <tr key={p.id} className="hover:bg-muted/20">
+                <td className="px-3 py-2 text-foreground">{p.name}</td>
+                <td className="px-3 py-2">
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-medium ring-1",
+                      SURFACE_COLOR[p.surface]
+                    )}
+                  >
+                    {SURFACE_LABEL[p.surface]}
+                  </span>
+                </td>
+                <td className="px-3 py-2 font-mono text-muted-foreground">
+                  {p.source}
+                </td>
+                <td className="px-3 py-2 text-muted-foreground">{p.cadence}</td>
+                <td className="px-3 py-2 text-muted-foreground">
+                  {p.unit}
+                  {p.needs_indexing && (
+                    <span className="ml-1 rounded bg-orange-400/15 px-1 py-0.5 text-orange-300">
+                      indexer
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

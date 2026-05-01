@@ -2,10 +2,17 @@ import { NextResponse } from "next/server";
 import { nanoid } from "nanoid";
 import JSZip from "jszip";
 import { createJob } from "@/lib/job-store";
+import { extractAbis } from "@/lib/abi-extract";
 
 export const runtime = "nodejs";
 
-type Layout = "foundry" | "hardhat" | "abi-only" | "mixed" | "unknown";
+type Layout =
+  | "foundry"
+  | "hardhat"
+  | "abi-only"
+  | "mixed"
+  | "single-source"
+  | "unknown";
 
 type Scan = {
   abis: number;
@@ -15,10 +22,23 @@ type Scan = {
   totalUncompressedBytes: number;
 };
 
+function isZipFilename(name: string): boolean {
+  return name.toLowerCase().endsWith(".zip");
+}
+
+function isSourceFilename(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".sol") || lower.endsWith(".vy");
+}
+
+function looksLikeZipBytes(buf: Buffer): boolean {
+  // ZIP local file header: 0x50 0x4B 0x03 0x04
+  return buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
+}
+
 const MAX_SNIFF_BYTES = 64 * 1024;
 
-async function scanBundle(file: File): Promise<Scan> {
-  const buf = Buffer.from(await file.arrayBuffer());
+async function scanBundle(buf: Buffer): Promise<Scan> {
   const zip = await JSZip.loadAsync(buf);
 
   let abis = 0;
@@ -128,32 +148,64 @@ export async function POST(req: Request) {
 
   if (!(bundle instanceof File) || bundle.size === 0) {
     return NextResponse.json(
-      { error: "Project bundle (.zip) is required" },
+      { error: "Project source (.zip / .sol / .vy) is required" },
+      { status: 400 }
+    );
+  }
+
+  let bundleBuffer: Buffer;
+  try {
+    bundleBuffer = Buffer.from(await bundle.arrayBuffer());
+  } catch (err) {
+    return NextResponse.json(
+      { error: `Failed to read upload: ${(err as Error).message}` },
+      { status: 400 }
+    );
+  }
+
+  const isZip = isZipFilename(bundle.name) || looksLikeZipBytes(bundleBuffer);
+  const isSource = !isZip && isSourceFilename(bundle.name);
+
+  if (!isZip && !isSource) {
+    return NextResponse.json(
+      { error: "Unsupported file type. Use .zip, .sol, or .vy" },
       { status: 400 }
     );
   }
 
   let scan: Scan;
-  try {
-    scan = await scanBundle(bundle);
-  } catch (err) {
-    return NextResponse.json(
-      { error: `Failed to read ZIP: ${(err as Error).message}` },
-      { status: 400 }
-    );
-  }
-
-  if (scan.sources === 0 && scan.abis === 0) {
-    return NextResponse.json(
-      {
-        error:
-          "No ABIs or Solidity sources found in the bundle. Make sure you zip from a built Foundry (out/) or Hardhat (artifacts/) project, or include the .sol files directly.",
-      },
-      { status: 400 }
-    );
+  if (isZip) {
+    try {
+      scan = await scanBundle(bundleBuffer);
+    } catch (err) {
+      return NextResponse.json(
+        { error: `Failed to read ZIP: ${(err as Error).message}` },
+        { status: 400 }
+      );
+    }
+    if (scan.sources === 0 && scan.abis === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "No ABIs or Solidity sources found in the bundle. Make sure you zip from a built Foundry (out/) or Hardhat (artifacts/) project, or include the .sol files directly.",
+        },
+        { status: 400 }
+      );
+    }
+  } else {
+    // Single .sol / .vy file — synthesize a scan
+    scan = {
+      abis: 0,
+      sources: 1,
+      layout: "single-source",
+      files: 1,
+      totalUncompressedBytes: bundle.size,
+    };
   }
 
   const id = nanoid(10);
+
+  const contractAbis = isZip ? await extractAbis(bundleBuffer, contracts) : [];
 
   createJob(id, {
     protocol,
@@ -164,11 +216,13 @@ export async function POST(req: Request) {
       | "manual"
       | "skip",
     contracts,
+    contractAbis,
     abiCount: scan.abis,
     sourceCount: scan.sources,
     layout: scan.layout,
     bundleName: bundle.name,
     bundleSize: bundle.size,
+    bundleBuffer,
   });
 
   // eslint-disable-next-line no-console

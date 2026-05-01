@@ -8,6 +8,7 @@ import {
   ArrowLeft,
   ArrowRight,
   FileArchive,
+  Info,
   Loader2,
   Plus,
   Sparkles,
@@ -221,10 +222,26 @@ export function SubmitForm() {
         <Section
           title={
             <>
-              Project bundle <span className="text-lime-400">*</span>
+              Project source <span className="text-lime-400">*</span>
             </>
           }
-          subtitle="Drop a zipped Foundry / Hardhat project. We auto-detect ABIs (out/, artifacts/) and Solidity / Vyper sources — no per-file picking."
+          subtitle="Drop a zipped Foundry / Hardhat project, OR a single .sol / .vy file."
+          info={
+            <div className="flex flex-col gap-2">
+              <div>
+                <span className="font-heading text-foreground">ZIP (recommended)</span>
+                <p className="mt-1 text-muted-foreground">
+                  Full project context — multiple contracts, imports, full ABIs. Richer analysis and the dashboard can read live state via ethers.js calls (e.g. <span className="font-mono">Pool.totalSupply()</span>).
+                </p>
+              </div>
+              <div className="border-t border-border/60 pt-2">
+                <span className="font-heading text-foreground">Single .sol / .vy</span>
+                <p className="mt-1 text-muted-foreground">
+                  Faster for quick prototyping but limits live values to what doesn&apos;t need an ABI: ETH balance, deployed bytecode hash, and chain ID. Function-call parameters will show <span className="font-mono">—</span>.
+                </p>
+              </div>
+            </div>
+          }
         >
           <BundleDropzone bundle={bundle} onBundle={setBundle} />
         </Section>
@@ -362,22 +379,47 @@ function missingFields(
 function Section({
   title,
   subtitle,
+  info,
   children,
 }: {
   title: React.ReactNode;
   subtitle?: string;
+  info?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <section className="flex flex-col gap-4 rounded-xl bg-card p-5 ring-1 ring-foreground/10">
       <header className="space-y-1">
-        <h2 className="font-heading text-base font-medium">{title}</h2>
+        <h2 className="flex items-center gap-2 font-heading text-base font-medium">
+          {title}
+          {info && <InfoTooltip>{info}</InfoTooltip>}
+        </h2>
         {subtitle && (
           <p className="text-xs leading-5 text-muted-foreground">{subtitle}</p>
         )}
       </header>
       <div className="flex flex-col gap-3">{children}</div>
     </section>
+  );
+}
+
+function InfoTooltip({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="group relative inline-flex">
+      <button
+        type="button"
+        aria-label="More info"
+        className="flex size-4 items-center justify-center rounded-full text-muted-foreground/70 hover:text-foreground"
+      >
+        <Info className="size-3.5" />
+      </button>
+      <span
+        role="tooltip"
+        className="pointer-events-none invisible absolute left-1/2 top-full z-20 mt-2 w-80 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-xs font-normal leading-5 text-popover-foreground opacity-0 shadow-xl ring-1 ring-foreground/5 transition-all group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100"
+      >
+        {children}
+      </span>
+    </span>
   );
 }
 
@@ -486,12 +528,15 @@ function BundleDropzone({
   const [drag, setDrag] = useState(false);
 
   function accept(file: File) {
+    const lower = file.name.toLowerCase();
     const ok =
-      file.name.toLowerCase().endsWith(".zip") ||
+      lower.endsWith(".zip") ||
+      lower.endsWith(".sol") ||
+      lower.endsWith(".vy") ||
       file.type === "application/zip" ||
       file.type === "application/x-zip-compressed";
     if (!ok) {
-      toast.error("Only .zip bundles are supported");
+      toast.error("Supported: .zip, .sol, .vy");
       return;
     }
     onBundle(file);
@@ -511,6 +556,13 @@ function BundleDropzone({
   }
 
   if (bundle) {
+    const lower = bundle.name.toLowerCase();
+    const isZip = lower.endsWith(".zip");
+    const kindLabel = isZip
+      ? "ZIP project"
+      : lower.endsWith(".vy")
+        ? "Vyper file"
+        : "Solidity file";
     return (
       <div className="flex items-center gap-3 rounded-lg border border-lime-400/40 bg-lime-400/5 px-3 py-3 ring-1 ring-lime-400/20">
         <div className="flex size-10 items-center justify-center rounded-full bg-lime-400/15 text-lime-300 ring-1 ring-lime-400/40">
@@ -521,7 +573,7 @@ function BundleDropzone({
             {bundle.name}
           </span>
           <span className="text-xs text-muted-foreground">
-            {(bundle.size / 1024 / 1024).toFixed(2)} MB · ready to upload
+            {(bundle.size / 1024).toFixed(1)} KB · {kindLabel} · ready to upload
           </span>
         </div>
         <Button
@@ -555,19 +607,19 @@ function BundleDropzone({
       </div>
       <div className="flex flex-col gap-0.5">
         <span className="font-heading text-sm font-medium">
-          Drop your project ZIP here
+          Drop a <span className="font-mono">.zip</span> /{" "}
+          <span className="font-mono">.sol</span> /{" "}
+          <span className="font-mono">.vy</span>
         </span>
         <span className="text-xs text-muted-foreground">
-          Foundry, Hardhat, or anything with{" "}
-          <span className="font-mono">.sol</span> /{" "}
-          <span className="font-mono">.vy</span> +{" "}
-          <span className="font-mono">.json</span> ABIs · or click to browse
+          Zipped Foundry / Hardhat project (with ABIs), OR a single
+          Solidity / Vyper file · click to browse
         </span>
       </div>
       <input
         ref={inputRef}
         type="file"
-        accept=".zip,application/zip,application/x-zip-compressed"
+        accept=".zip,.sol,.vy,application/zip,application/x-zip-compressed,text/plain"
         onChange={onPick}
         className="hidden"
       />

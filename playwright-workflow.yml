@@ -1,0 +1,29 @@
+name: Playwright E2E (helper file - move to .github/workflows/playwright.yml)
+
+on: [push, pull_request]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm --prefix web ci
+      - name: Install Playwright browsers
+        run: npx --yes playwright install --with-deps
+      - name: Build web
+        run: npm --prefix web run build
+      - name: Start web (background)
+        run: nohup npm --prefix web run start & sleep 2
+      - name: Run Playwright tests
+        run: npx --yes playwright test --config=web/playwright.config.ts --reporter=list
+      - name: Upload Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report

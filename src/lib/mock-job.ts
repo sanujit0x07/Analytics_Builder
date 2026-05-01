@@ -1,3 +1,5 @@
+import type { Analysis } from "./claude-pipeline";
+
 export type PhaseId =
   | "parsing"
   | "classification"
@@ -58,6 +60,10 @@ export type JobRun = {
   source: JobSource;
   logs: LogLine[];
   history: JobRunSummary[];
+  analysis?: Analysis;
+  selectedParamIds?: string[];
+  error?: string;
+  contractAbis?: { name: string; chainId: number; address: string; abi: unknown[] }[];
 };
 
 import { SUPPORTED_CHAINS } from "@/lib/chains";

@@ -1,3 +1,4 @@
+import { analyzeProtocol, type Analysis } from "./claude-pipeline";
 import type { JobRun, Phase, PhaseId } from "./mock-job";
 
 declare global {
@@ -15,6 +16,14 @@ export function listStoredJobs(): JobRun[] {
   return Array.from(store.values());
 }
 
+export function setSelectedParams(id: string, paramIds: string[]) {
+  const j = store.get(id);
+  if (!j) return false;
+  j.selectedParamIds = paramIds;
+  store.set(id, j);
+  return true;
+}
+
 const PHASES_TEMPLATE: Pick<Phase, "id" | "title" | "description">[] = [
   {
     id: "parsing",
@@ -25,14 +34,12 @@ const PHASES_TEMPLATE: Pick<Phase, "id" | "title" | "description">[] = [
   {
     id: "classification",
     title: "Archetype classification",
-    description:
-      "Identify protocol archetype, sub-type, oracle source, liquidation model.",
+    description: "Claude analyzes source to identify archetype + sub-type.",
   },
   {
     id: "extraction",
     title: "Parameter & risk-surface extraction",
-    description:
-      "Derive canonical metric set + protocol-specific parameters from code.",
+    description: "Derive canonical metric set + protocol-specific parameters.",
   },
   {
     id: "fetch_plan",
@@ -44,7 +51,7 @@ const PHASES_TEMPLATE: Pick<Phase, "id" | "title" | "description">[] = [
     id: "branding",
     title: "Brand extraction & token emission",
     description:
-      "Auto-extract palette/typography/logo; verify WCAG AA; emit design_tokens.",
+      "Extract palette/typography/logo; verify WCAG AA; emit design_tokens.",
   },
   {
     id: "rendering",
@@ -54,26 +61,19 @@ const PHASES_TEMPLATE: Pick<Phase, "id" | "title" | "description">[] = [
   },
 ];
 
-const PHASE_DURATION_MS: Record<PhaseId, number> = {
-  parsing: 1500,
-  classification: 2200,
-  extraction: 2800,
-  fetch_plan: 2400,
-  branding: 1700,
-  rendering: 1800,
-};
-
 export type CreateJobInput = {
   protocol: string;
   websiteUrl: string;
   description: string;
   brandMode: "auto" | "manual" | "skip";
   contracts: { name: string; address: string; chainId: number }[];
+  contractAbis: { name: string; chainId: number; address: string; abi: unknown[] }[];
   abiCount: number;
   sourceCount: number;
   layout: string;
   bundleName: string;
   bundleSize: number;
+  bundleBuffer: Buffer;
 };
 
 function pad(n: number) {
@@ -91,25 +91,26 @@ function friendlyDate(iso: string) {
   return `${d.getDate()} ${month}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function doneLog(p: PhaseId, j: JobRun): string {
-  switch (p) {
-    case "parsing":
-      return `Resolved ${j.source.contracts.length} address(es); merged ABIs from bundle`;
-    case "classification":
-      return `Archetype identified: ${j.archetype}`;
-    case "extraction":
-      return `Extracted ${j.stats.parameters} parameters, ${j.stats.riskSurfaces} risk surfaces`;
-    case "fetch_plan":
-      return `Generated ${j.stats.fetchCalls} multicall3 reads across ${new Set(j.source.contracts.map((c) => c.chainId)).size} chain(s)`;
-    case "branding":
-      return j.source.brandSource === "auto_extracted"
-        ? "Brand auto-extracted; WCAG AA verified"
-        : j.source.brandSource === "manual_input"
-          ? "Manual brand tokens validated"
-          : "Default theme applied";
-    case "rendering":
-      return "Dashboard composed — Overview / Positions / Risk / Oracles ready";
-  }
+function update(id: string, mutate: (j: JobRun) => void) {
+  const j = store.get(id);
+  if (!j) return;
+  mutate(j);
+  j.durationMs = Date.now() - new Date(j.startedAt).getTime();
+  store.set(id, j);
+}
+
+function markPhase(j: JobRun, phaseId: PhaseId, status: Phase["status"]) {
+  j.phases = j.phases.map((p) => {
+    if (p.id !== phaseId) return p;
+    if (status === "running") return { ...p, status, startedAt: new Date().toISOString() };
+    if (status === "done") return { ...p, status, finishedAt: new Date().toISOString() };
+    return { ...p, status };
+  });
+  if (status === "running") j.currentPhase = phaseId;
+}
+
+function log(j: JobRun, phase: PhaseId, message: string, level: "info" | "warn" | "error" = "info") {
+  j.logs.push({ ts: ts(), level, phase, message });
 }
 
 export function createJob(id: string, input: CreateJobInput): JobRun {
@@ -119,17 +120,6 @@ export function createJob(id: string, input: CreateJobInput): JobRun {
     status: i === 0 ? "running" : "pending",
     startedAt: i === 0 ? startedAt : undefined,
   }));
-  const totalEstimate = Object.values(PHASE_DURATION_MS).reduce(
-    (a, b) => a + b,
-    0
-  );
-
-  const parameters = Math.max(
-    12,
-    input.sourceCount * 5 + Math.floor(input.abiCount * 1.2)
-  );
-  const riskSurfaces = Math.max(4, Math.round(parameters * 0.22));
-  const fetchCalls = Math.max(8, Math.round(parameters * 0.7));
 
   const job: JobRun = {
     id,
@@ -137,10 +127,10 @@ export function createJob(id: string, input: CreateJobInput): JobRun {
     archetype: "Pending classification…",
     status: "running",
     startedAt,
-    estimatedMs: totalEstimate,
+    estimatedMs: 60_000,
     durationMs: 0,
     currentPhase: "parsing",
-    stats: { parameters, riskSurfaces, fetchCalls },
+    stats: { parameters: 0, riskSurfaces: 0, fetchCalls: 0 },
     phases,
     source: {
       abis: [
@@ -173,57 +163,128 @@ export function createJob(id: string, input: CreateJobInput): JobRun {
         durationMs: 0,
       },
     ],
+    contractAbis: input.contractAbis,
   };
 
   store.set(id, job);
-  scheduleAdvance(id, 0);
+  void runPipeline(id, input);
   return job;
 }
 
-function scheduleAdvance(id: string, phaseIndex: number) {
-  const tpl = PHASES_TEMPLATE[phaseIndex];
-  if (!tpl) return;
-  setTimeout(() => {
-    const j = store.get(id);
-    if (!j) return;
+async function runPipeline(id: string, input: CreateJobInput) {
+  // Phase 1 — parsing — already running, mark done quickly
+  await new Promise((r) => setTimeout(r, 600));
+  update(id, (j) => {
+    markPhase(j, "parsing", "done");
+    log(j, "parsing", `Resolved ${input.contracts.length} address(es); selected source files for analysis`);
+    markPhase(j, "classification", "running");
+    log(j, "classification", "Calling Claude Opus 4.7 with adaptive thinking…");
+  });
 
-    if (tpl.id === "classification") {
-      // Set a plausible archetype name once classification "completes"
-      j.archetype = "Lending — pooled (mock classification)";
-    }
-
-    j.phases = j.phases.map((p, i) =>
-      i === phaseIndex
-        ? { ...p, status: "done", finishedAt: new Date().toISOString() }
-        : p
-    );
-    j.logs.push({
-      ts: ts(),
-      level: "info",
-      phase: tpl.id,
-      message: doneLog(tpl.id, j),
+  // Phase 2 — classification (Claude call)
+  let analysis: Analysis;
+  try {
+    analysis = await analyzeProtocol({
+      protocol: input.protocol,
+      websiteUrl: input.websiteUrl,
+      description: input.description,
+      contracts: input.contracts,
+      bundleBuffer: input.bundleBuffer,
+      bundleName: input.bundleName,
     });
-    j.durationMs = Date.now() - new Date(j.startedAt).getTime();
-
-    const next = PHASES_TEMPLATE[phaseIndex + 1];
-    if (next) {
-      j.currentPhase = next.id;
-      j.phases = j.phases.map((p, i) =>
-        i === phaseIndex + 1
-          ? { ...p, status: "running", startedAt: new Date().toISOString() }
-          : p
-      );
-      store.set(id, j);
-      scheduleAdvance(id, phaseIndex + 1);
-    } else {
-      j.status = "completed";
-      j.finishedAt = new Date().toISOString();
+  } catch (err) {
+    update(id, (j) => {
+      const msg = (err as Error).message;
+      j.status = "failed";
+      j.error = msg;
+      log(j, j.currentPhase, `Pipeline failed: ${msg}`, "error");
+      markPhase(j, j.currentPhase, "failed");
       j.history = j.history.map((h) =>
-        h.id === id
-          ? { ...h, status: "completed", durationMs: j.durationMs }
-          : h
+        h.id === id ? { ...h, status: "failed", durationMs: j.durationMs } : h
       );
-      store.set(id, j);
+    });
+    return;
+  }
+
+  // Classification result lands; mark phases 2-4 done in sequence
+  update(id, (j) => {
+    j.archetype = `${analysis.archetype}${analysis.subtype ? ` — ${analysis.subtype}` : ""}`;
+    log(
+      j,
+      "classification",
+      `Archetype: ${analysis.archetype} (confidence ${analysis.confidence.toFixed(2)})`
+    );
+    markPhase(j, "classification", "done");
+    markPhase(j, "extraction", "running");
+  });
+
+  await new Promise((r) => setTimeout(r, 400));
+  update(id, (j) => {
+    const surfaces = new Set(analysis.parameters.map((p) => p.surface));
+    j.stats.parameters = analysis.parameters.length;
+    j.stats.riskSurfaces = surfaces.size;
+    log(
+      j,
+      "extraction",
+      `Extracted ${analysis.parameters.length} parameters across ${surfaces.size} risk surfaces`
+    );
+    markPhase(j, "extraction", "done");
+    markPhase(j, "fetch_plan", "running");
+  });
+
+  await new Promise((r) => setTimeout(r, 400));
+  update(id, (j) => {
+    const liveCount = analysis.parameters.filter((p) => !p.needs_indexing).length;
+    j.stats.fetchCalls = liveCount;
+    const indexerNeeds = analysis.parameters.length - liveCount;
+    log(
+      j,
+      "fetch_plan",
+      `${liveCount} parameters servable from multicall3; ${indexerNeeds} need event indexing`
+    );
+    if (indexerNeeds > 0) {
+      log(
+        j,
+        "fetch_plan",
+        `Flagged ${indexerNeeds} parameter(s) for indexer in open_questions`,
+        "warn"
+      );
     }
-  }, PHASE_DURATION_MS[tpl.id]);
+    markPhase(j, "fetch_plan", "done");
+    markPhase(j, "branding", "running");
+  });
+
+  // Phase 5 — branding (placeholder; auto-extract is a separate task)
+  await new Promise((r) => setTimeout(r, 800));
+  update(id, (j) => {
+    log(
+      j,
+      "branding",
+      j.source.brandSource === "auto_extracted"
+        ? "Brand auto-extract deferred — using neutral default theme for now"
+        : j.source.brandSource === "manual_input"
+          ? "Manual brand tokens validated"
+          : "Default theme applied"
+    );
+    markPhase(j, "branding", "done");
+    markPhase(j, "rendering", "running");
+  });
+
+  // Phase 6 — rendering: persist analysis + default-select all params
+  await new Promise((r) => setTimeout(r, 600));
+  update(id, (j) => {
+    j.analysis = analysis;
+    j.selectedParamIds = analysis.parameters.map((p) => p.id);
+    log(
+      j,
+      "rendering",
+      `Prepared dashboard config — ${analysis.parameters.length} parameters available for selection`
+    );
+    markPhase(j, "rendering", "done");
+    j.status = "completed";
+    j.finishedAt = new Date().toISOString();
+    j.history = j.history.map((h) =>
+      h.id === id ? { ...h, status: "completed", durationMs: j.durationMs } : h
+    );
+  });
 }
